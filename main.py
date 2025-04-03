@@ -28,17 +28,17 @@ def handle_selenium_errors(func):
                 return func(*args, **kwargs)
             except (ElementNotInteractableException, ElementClickInterceptedException) as e:
                 self.log(f"Ошибка взаимодействия: {str(e)}")
-                time.sleep(0.5)
+                time.sleep(0.3)
                 if attempt == max_retries - 1:
                     raise
             except TimeoutException as e:
                 self.log(f"Таймаут операции: {str(e)}")
-                time.sleep(1)
+                time.sleep(0.3)
                 if attempt == max_retries - 1:
                     raise
             except WebDriverException as e:
                 self.log(f"Ошибка WebDriver: {str(e)}")
-                time.sleep(1)
+                time.sleep(0.3)
                 if attempt == max_retries - 1:
                     raise
     return wrapper
@@ -60,6 +60,8 @@ class PDFTranslatorApp:
     def convert_pdf_to_images(self, pdf_path, output_dir, dpi=300):
         doc = fitz.open(pdf_path)
         total = len(doc)
+        max_size = 5 * 1024 * 1024  # 5 MB in bytes
+
         for page_num in range(total):
             if self.stop_flag:
                 break
@@ -67,6 +69,26 @@ class PDFTranslatorApp:
             pix = page.get_pixmap(dpi=dpi)
             image_path = os.path.join(output_dir, f"{page_num + 1}.png")
             pix.save(image_path)
+
+            with Image.open(image_path) as img:
+                quality = img.info.get("quality", 90)
+
+            while os.path.getsize(image_path) > max_size:
+                self.log(f"Страница {page_num+1} слишком большая: сжимаем (качество: {quality})...")
+                
+                quality -= 5
+                if quality < 5:
+                    self.log("Достигнуто минимальное качество. Прерывание сжатия.")
+                    break
+                
+                with Image.open(image_path) as img:
+                    img.save(image_path, optimize=True, quality=quality)
+            
+                current_size = os.path.getsize(image_path)
+                if current_size <= max_size:
+                    self.log(f"Сжатие успешно.")
+                    break
+
             self.update_progress((page_num + 1) * 30 / total)
         doc.close()
         return total
@@ -96,24 +118,59 @@ class PDFTranslatorApp:
 
     @handle_selenium_errors
     def process_page(self, image_path, download_dir, page_num):
-        drop_area = WebDriverWait(self.driver, 20).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "#ocrContainer > div > div > div")))
-        drop_area.click()
+        original_image = image_path
+        max_attempts = 2
+        processed = False
         
-        file_input = self.driver.find_element(By.XPATH, "//input[@type='file']")
-        file_input.send_keys(image_path)
+        for attempt in range(max_attempts):
+            try:
+                # Попытка обработки страницы
+                drop_area = WebDriverWait(self.driver, 20).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "#ocrContainer > div > div > div")))
+                drop_area.click()
+                
+                file_input = self.driver.find_element(By.XPATH, "//input[@type='file']")
+                file_input.send_keys(image_path)
+                time.sleep(0.3)
+                
+                # Проверка на ошибку распознавания (только при второй попытке)
+                if attempt >= 1:
+                    error_elements = self.driver.find_elements(
+                        By.CSS_SELECTOR, ".errorMessage_no_text")
+                    if error_elements:
+                        self.log(f"Страница {page_num}: Текст не распознан, используется оригинал")
+                        shutil.copy(original_image, 
+                                   os.path.join(download_dir, f"{page_num}.png"))
+                        return
+
+                WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-action="download"]')))
+                
+                download_btn = self.driver.find_element(
+                    By.CSS_SELECTOR, 'button[data-action="download"]')
+                download_btn.click()
+                
+                downloaded_file = self.wait_for_download_complete(download_dir)
+                if downloaded_file:
+                    new_name = os.path.join(download_dir, f"{page_num}.png")
+                    os.replace(downloaded_file, new_name)
+                    processed = True
+                    break
+
+            except (TimeoutException, ElementNotInteractableException) as e:
+                if attempt == max_attempts - 1:
+                    self.log(f"Страница {page_num}: Не удалось обработать, используется оригинал")
+                    shutil.copy(original_image, 
+                               os.path.join(download_dir, f"{page_num}.png"))
+                else:
+                    self.driver.refresh()
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "#ocrContainer")))
         
-        WebDriverWait(self.driver, 30).until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, 'button[data-action="download"]'))
-        )
-        
-        download_btn = self.driver.find_element(By.CSS_SELECTOR, 'button[data-action="download"]')
-        download_btn.click()
-        
-        downloaded_file = self.wait_for_download_complete(download_dir)
-        if downloaded_file:
-            new_name = os.path.join(download_dir, f"{page_num}.png")
-            os.replace(downloaded_file, new_name)
+        if not processed:
+            self.log(f"Страница {page_num}: Использован оригинал после {max_attempts} попыток")
+            shutil.copy(original_image, 
+                       os.path.join(download_dir, f"{page_num}.png"))
 
     def wait_for_download_complete(self, download_dir, timeout=30):
         start_time = time.time()
